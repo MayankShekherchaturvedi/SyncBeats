@@ -12,13 +12,34 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { createAudioPlayer, setAudioModeAsync } from 'expo-audio';
 import * as FileSystem from 'expo-file-system/legacy';
+import Constants from 'expo-constants';
+import * as Network from 'expo-network';
 import io from 'socket.io-client';
 
-const DEFAULT_SERVER_URL = 'http://192.168.1.13:5000';
+// Automatically detect host IP from Metro / Expo bundler during development
+const getDetectedServerUrl = () => {
+  if (process.env.EXPO_PUBLIC_SERVER_URL) {
+    return process.env.EXPO_PUBLIC_SERVER_URL;
+  }
+  const hostUri =
+    Constants.expoConfig?.hostUri ||
+    Constants.manifest2?.extra?.expoGo?.debuggerHost ||
+    Constants.manifest?.debuggerHost;
+  if (hostUri) {
+    const ip = hostUri.split(':')[0];
+    if (ip && ip !== 'localhost' && ip !== '127.0.0.1') {
+      return `http://${ip}:5000`;
+    }
+  }
+  return 'http://192.168.1.13:5000';
+};
+
 const CACHED_TRACK_PATH = FileSystem.cacheDirectory + 'syncbeats_current_track.mp3';
 
 export default function App() {
-  const [serverUrl, setServerUrl] = useState(DEFAULT_SERVER_URL);
+  const [serverUrl, setServerUrl] = useState(getDetectedServerUrl);
+  const [isScanning, setIsScanning] = useState(false);
+  const [showManualIp, setShowManualIp] = useState(false);
 
   // Song library state
   const [songs, setSongs] = useState([]);
@@ -48,6 +69,95 @@ export default function App() {
   const isRemoteEvent = useRef(false);
   const pendingSync = useRef(null);
   const downloadResumableRef = useRef(null);
+
+  // ─── Auto-Detect Server on Local Wi-Fi Subnet ──────────────────────────────
+  const scanForNearbyServer = useCallback(async () => {
+    setIsScanning(true);
+    setErrorMessage('');
+    setStatusText('Scanning Wi-Fi...');
+
+    try {
+      const candidates = [];
+
+      // 1. Check Metro host IP from Expo Constants
+      const hostUri =
+        Constants.expoConfig?.hostUri ||
+        Constants.manifest2?.extra?.expoGo?.debuggerHost ||
+        Constants.manifest?.debuggerHost;
+      if (hostUri) {
+        const metroIp = hostUri.split(':')[0];
+        if (metroIp) candidates.push(`http://${metroIp}:5000`);
+      }
+
+      // 2. Add current serverUrl
+      if (serverUrl && !candidates.includes(serverUrl)) {
+        candidates.push(serverUrl);
+      }
+
+      // 3. Scan phone's local subnet
+      try {
+        const deviceIp = await Network.getIpAddressAsync();
+        if (deviceIp && deviceIp.includes('.')) {
+          const parts = deviceIp.split('.');
+          const prefix = `${parts[0]}.${parts[1]}.${parts[2]}`;
+          const currentOctet = parseInt(parts[3], 10);
+
+          const octetsToTest = new Set([1, 2, 10, 11, 12, 13, 14, 15, 20, 50, 100, 101]);
+          for (let i = Math.max(1, currentOctet - 15); i <= Math.min(254, currentOctet + 15); i++) {
+            octetsToTest.add(i);
+          }
+
+          for (const octet of octetsToTest) {
+            const candidate = `http://${prefix}.${octet}:5000`;
+            if (!candidates.includes(candidate)) {
+              candidates.push(candidate);
+            }
+          }
+        }
+      } catch (netErr) {
+        console.log('Could not retrieve local device IP:', netErr);
+      }
+
+      const probeHost = async (url) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 1200);
+        try {
+          const res = await fetch(`${url}/health`, { signal: controller.signal });
+          clearTimeout(timer);
+          if (res.ok) {
+            const data = await res.json();
+            if (data.status === 'ok') return url;
+          }
+        } catch {
+          // Unreachable candidate
+        }
+        return null;
+      };
+
+      // Probe candidates in parallel batches of 8
+      const batchSize = 8;
+      for (let i = 0; i < candidates.length; i += batchSize) {
+        const batch = candidates.slice(i, i + batchSize);
+        const results = await Promise.all(batch.map(probeHost));
+        const found = results.find(Boolean);
+        if (found) {
+          setServerUrl(found);
+          setStatusText('Found Server!');
+          setIsScanning(false);
+          return found;
+        }
+      }
+
+      setStatusText('Not Connected');
+      setErrorMessage('No Syncbeats host found on this Wi-Fi. Check if backend is running.');
+    } catch {
+      setStatusText('Scan Failed');
+      setErrorMessage('Network scan failed. Ensure Wi-Fi is enabled.');
+    } finally {
+      setIsScanning(false);
+    }
+    return null;
+  }, [serverUrl]);
 
   // ─── Fetch song catalog ────────────────────────────────────────────────────
   const fetchSongs = useCallback(async (url) => {
@@ -85,7 +195,7 @@ export default function App() {
         playerRef.current = null;
       }
 
-      // Delete old cache file if present
+      // Delete old cache file if present using legacy filesystem API
       const existing = await FileSystem.getInfoAsync(CACHED_TRACK_PATH);
       if (existing.exists) {
         await FileSystem.deleteAsync(CACHED_TRACK_PATH, { idempotent: true });
@@ -180,7 +290,7 @@ export default function App() {
 
     socket.on('connect_error', () => {
       setStatusText('Connection error');
-      setErrorMessage(`Cannot connect to backend at ${serverUrl}`);
+      setErrorMessage(`Cannot connect to ${serverUrl}. Tap "Auto-Detect" above to find host.`);
     });
 
     socket.on('songs-updated', () => {
@@ -394,18 +504,50 @@ export default function App() {
         {!joined ? (
           <View style={{ width: '100%', maxWidth: 400 }}>
 
-            {/* Backend URL input */}
+            {/* Nearby Server Connection Card with Auto-Discovery */}
             <View style={styles.card}>
-              <Text style={styles.label}>Backend Server URL</Text>
-              <TextInput
-                style={styles.input}
-                placeholder="http://192.168.1.13:5000"
-                placeholderTextColor="#555"
-                value={serverUrl}
-                onChangeText={setServerUrl}
-                autoCapitalize="none"
-                autoCorrect={false}
-              />
+              <View style={styles.serverRow}>
+                <View style={{ flex: 1, marginRight: 10 }}>
+                  <Text style={styles.label}>Nearby Host Server</Text>
+                  <Text style={styles.serverUrlText} numberOfLines={1}>
+                    {serverUrl}
+                  </Text>
+                </View>
+
+                <TouchableOpacity
+                  style={[styles.scanButton, isScanning && { opacity: 0.6 }]}
+                  onPress={scanForNearbyServer}
+                  disabled={isScanning}
+                >
+                  <Text style={styles.scanButtonText}>
+                    {isScanning ? '⏳ Scanning…' : '🔍 Auto-Detect'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+
+              {/* Toggle manual IP */}
+              <TouchableOpacity
+                style={{ marginTop: 8, alignSelf: 'flex-start' }}
+                onPress={() => setShowManualIp(!showManualIp)}
+              >
+                <Text style={styles.toggleManualText}>
+                  {showManualIp ? 'Hide manual configuration' : 'Configure IP manually'}
+                </Text>
+              </TouchableOpacity>
+
+              {showManualIp && (
+                <View style={{ marginTop: 10 }}>
+                  <TextInput
+                    style={styles.input}
+                    placeholder="http://192.168.1.x:5000"
+                    placeholderTextColor="#555"
+                    value={serverUrl}
+                    onChangeText={setServerUrl}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                  />
+                </View>
+              )}
             </View>
 
             {/* Create Room section */}
@@ -652,6 +794,35 @@ const styles = StyleSheet.create({
     borderColor: '#2a2a2a',
     marginBottom: 12,
   },
+  serverRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  serverUrlText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+    marginTop: 2,
+  },
+  scanButton: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: '#1db95420',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#1db954',
+  },
+  scanButtonText: {
+    color: '#1db954',
+    fontSize: 12,
+    fontWeight: 'bold',
+  },
+  toggleManualText: {
+    color: '#888',
+    fontSize: 12,
+    textDecorationLine: 'underline',
+  },
   sectionTitle: {
     fontSize: 16,
     fontWeight: '700',
@@ -659,7 +830,7 @@ const styles = StyleSheet.create({
     marginBottom: 6,
   },
   hint: { fontSize: 12, color: '#777', marginBottom: 12 },
-  label: { fontSize: 12, color: '#aaa', marginBottom: 6 },
+  label: { fontSize: 11, color: '#888', textTransform: 'uppercase', letterSpacing: 0.5 },
   input: {
     width: '100%',
     height: 46,
